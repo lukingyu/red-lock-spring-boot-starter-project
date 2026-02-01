@@ -11,7 +11,7 @@ public @interface Idempotent {
     /**
      * 幂等Key的前缀，区分业务
      */
-    String prefix() default "idempotent:";
+    String prefix() default "";
 
     /**
      * 支持 SpEL 表达式
@@ -24,15 +24,15 @@ public @interface Idempotent {
     /**
      * 过期时间（默认5秒内不允许重复提交）
      */
-    long timeout() default 5;
+    long timeout() default -1;
 
     /**
      * 时间单位
      */
-    TimeUnit timeUnit() default TimeUnit.SECONDS;
+    TimeUnit timeUnit() default TimeUnit.NANOSECONDS;
 
     /**
      * 提示信息
      */
-    String message() default "操作太快，请稍后再试";
+    String message() default "";
 }

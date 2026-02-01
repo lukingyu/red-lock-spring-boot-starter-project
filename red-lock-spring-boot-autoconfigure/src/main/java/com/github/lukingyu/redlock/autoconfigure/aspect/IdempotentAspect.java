@@ -1,6 +1,7 @@
 package com.github.lukingyu.redlock.autoconfigure.aspect;
 
 import com.github.lukingyu.redlock.autoconfigure.annotation.Idempotent;
+import com.github.lukingyu.redlock.autoconfigure.config.RedLockProperties;
 import com.github.lukingyu.redlock.autoconfigure.exception.IdempotentException;
 import lombok.RequiredArgsConstructor;
 import org.aspectj.lang.JoinPoint;
@@ -23,12 +24,14 @@ import jakarta.servlet.http.HttpServletRequest;
 
 import java.lang.reflect.Method;
 import java.util.Collections;
+import java.util.concurrent.TimeUnit;
 
 @Aspect
 @RequiredArgsConstructor
 public class IdempotentAspect {
 
     private final StringRedisTemplate redisTemplate;
+    private final RedLockProperties properties;
 
     // SpEL 解析器
     private final ParameterNameDiscoverer parameterNameDiscoverer = new DefaultParameterNameDiscoverer();
@@ -51,13 +54,17 @@ public class IdempotentAspect {
     public void before(JoinPoint joinPoint, Idempotent idempotent) {
         // 1. 获取请求参数，生成 Key
         String key = generateKey(joinPoint, idempotent);
-        
+
+        long timeOut = idempotent.timeout() != -1 ? idempotent.timeout() : properties.getTimeout();
+        TimeUnit timeUnit = idempotent.timeUnit() != TimeUnit.NANOSECONDS ? idempotent.timeUnit() : properties.getTimeUnit();
+
         // 2. 执行 Lua 脚本
-        Long result = redisTemplate.execute(redisScript, Collections.singletonList(key), "1", String.valueOf(idempotent.timeUnit().toSeconds(idempotent.timeout())));
+        Long result = redisTemplate.execute(redisScript, Collections.singletonList(key), "1", String.valueOf(timeUnit.toSeconds(timeOut)));
 
         // 3. 判断结果：0表示锁已存在
         if (result == 0) {
-            throw new IdempotentException(idempotent.message());
+            String message = StringUtils.hasText(idempotent.message()) ? idempotent.message() : properties.getMessage();
+            throw new IdempotentException(message);
         }
     }
 
@@ -66,9 +73,14 @@ public class IdempotentAspect {
      * 确保同一个用户，对同一个接口，用同样的参数，在短时间内只能调一次
      */
     private String generateKey(JoinPoint joinPoint, Idempotent idempotent) {
+
+        final String prefix = StringUtils.hasText(idempotent.prefix()) ? idempotent.prefix() : properties.getPrefix();
+        //目前只支持注解传入
+        final String spEL = idempotent.spEL();
+
         // 用户使用了 SpEL 表达式 去获取自定义Key
-        if (StringUtils.hasText(idempotent.spEL())) {
-            return idempotent.prefix() + parseSpel(idempotent.spEL(), joinPoint);
+        if (StringUtils.hasText(spEL)) {
+            return prefix + parseSpel(spEL, joinPoint);
         }
 
         // 用户没配置 Key，尝试自动使用 Web 环境的 URL + Token
@@ -79,12 +91,12 @@ public class IdempotentAspect {
             String token = request.getHeader("Authorization");
             String method = request.getMethod();
             String uri = request.getRequestURI();
-            // 简单的将参数toString，实际生产建议用 MD5
+            // 简单的将参数toString
             String args = java.util.Arrays.toString(joinPoint.getArgs());
 
             String rawKey = token + ":" + method + ":" + uri + ":" + args;
             // MD5加密缩短Key长度
-            return idempotent.prefix() + DigestUtils.md5DigestAsHex(rawKey.getBytes());
+            return prefix + DigestUtils.md5DigestAsHex(rawKey.getBytes());
         }
 
         // 既没有 SpEL，又不是 Web 环境 -> 抛出异常，提示用户必须配置 key

@@ -2,3 +2,9 @@ server:
   port: 8080
   servlet:
     context-path: /redlock
+
+red-lock:
+  prefix: "idempotent:"
+  timeout: 10
+  time-unit: seconds
+  message: 操作太快，请稍后再试

@@ -28,5 +28,11 @@ public class SampleOrderController {
         return "";
     }
 
+    @PostMapping("/submit2")
+    @Idempotent
+    public String submit2(@RequestBody OrderDTO dto) {
+        return "";
+    }
+
 
 }
