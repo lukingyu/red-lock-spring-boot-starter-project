@@ -14,6 +14,14 @@ public @interface Idempotent {
     String prefix() default "idempotent:";
 
     /**
+     * 支持 SpEL 表达式
+     * 例如："#order.id" 或 "#userId"
+     * 如果为空，且在Web环境下，则自动计算MD5
+     */
+    String spEL() default "";
+
+
+    /**
      * 过期时间（默认5秒内不允许重复提交）
      */
     long timeout() default 5;

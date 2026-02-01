@@ -6,14 +6,22 @@ import lombok.RequiredArgsConstructor;
 import org.aspectj.lang.JoinPoint;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.annotation.Before;
+import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.context.expression.MethodBasedEvaluationContext;
+import org.springframework.core.DefaultParameterNameDiscoverer;
+import org.springframework.core.ParameterNameDiscoverer;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
+import org.springframework.expression.ExpressionParser;
+import org.springframework.expression.spel.standard.SpelExpressionParser;
 import org.springframework.util.DigestUtils;
+import org.springframework.util.StringUtils;
 import org.springframework.web.context.request.RequestContextHolder;
 import org.springframework.web.context.request.ServletRequestAttributes;
 import jakarta.servlet.http.HttpServletRequest;
 
+import java.lang.reflect.Method;
 import java.util.Collections;
 
 @Aspect
@@ -22,14 +30,20 @@ public class IdempotentAspect {
 
     private final StringRedisTemplate redisTemplate;
 
+    // SpEL 解析器
+    private final ParameterNameDiscoverer parameterNameDiscoverer = new DefaultParameterNameDiscoverer();
+    private final ExpressionParser expressionParser = new SpelExpressionParser();
+
     // LUA脚本：判断key是否存在，不存在则设置并设置过期时间
-    private static final String LUA_SCRIPT_TEXT = 
-        "if redis.call('setnx', KEYS[1], ARGV[1]) == 1 then " +
-        "   redis.call('expire', KEYS[1], ARGV[2]) " +
-        "   return 1 " +
-        "else " +
-        "   return 0 " +
-        "end";
+    private static final String LUA_SCRIPT_TEXT =
+        """
+        if redis.call('setnx', KEYS[1], ARGV[1]) == 1 then
+           redis.call('expire', KEYS[1], ARGV[2])
+           return 1
+        else
+           return 0
+        end
+        """;
     
     private final RedisScript<Long> redisScript = new DefaultRedisScript<>(LUA_SCRIPT_TEXT, Long.class);
 
@@ -52,16 +66,44 @@ public class IdempotentAspect {
      * 确保同一个用户，对同一个接口，用同样的参数，在短时间内只能调一次
      */
     private String generateKey(JoinPoint joinPoint, Idempotent idempotent) {
-        HttpServletRequest request = ((ServletRequestAttributes) RequestContextHolder.currentRequestAttributes()).getRequest();
-        // 实际场景建议取 Authorization Header 或 UserID
-        String token = request.getHeader("Authorization"); 
-        String method = request.getMethod();
-        String uri = request.getRequestURI();
-        String args = java.util.Arrays.toString(joinPoint.getArgs());
-        
-        // 组合成字符串
-        String rawKey = token + ":" + method + ":" + uri + ":" + args;
-        // MD5加密缩短Key长度
-        return idempotent.prefix() + DigestUtils.md5DigestAsHex(rawKey.getBytes());
+        // 用户使用了 SpEL 表达式 去获取自定义Key
+        if (StringUtils.hasText(idempotent.spEL())) {
+            return idempotent.prefix() + parseSpel(idempotent.spEL(), joinPoint);
+        }
+
+        // 用户没配置 Key，尝试自动使用 Web 环境的 URL + Token
+        // 先判断是否为 Web 环境，防止非 Web 项目报错
+        if (RequestContextHolder.getRequestAttributes() != null) {
+            HttpServletRequest request = ((ServletRequestAttributes) RequestContextHolder.getRequestAttributes()).getRequest();
+            // 实际场景建议取 Authorization Header 或 UserID
+            String token = request.getHeader("Authorization");
+            String method = request.getMethod();
+            String uri = request.getRequestURI();
+            // 简单的将参数toString，实际生产建议用 MD5
+            String args = java.util.Arrays.toString(joinPoint.getArgs());
+
+            String rawKey = token + ":" + method + ":" + uri + ":" + args;
+            // MD5加密缩短Key长度
+            return idempotent.prefix() + DigestUtils.md5DigestAsHex(rawKey.getBytes());
+        }
+
+        // 既没有 SpEL，又不是 Web 环境 -> 抛出异常，提示用户必须配置 key
+        throw new IllegalArgumentException("在非Web环境下，@Idempotent 注解必须配置 spEL 属性！");
+    }
+
+    /**
+     * 解析 SpEL 表达式
+     */
+    private String parseSpel(String el, JoinPoint joinPoint) {
+        MethodSignature methodSignature = (MethodSignature) joinPoint.getSignature();
+        Method method = methodSignature.getMethod();
+        Object[] args = joinPoint.getArgs();
+
+        // 创建 SpEL 上下文
+        MethodBasedEvaluationContext context = new MethodBasedEvaluationContext(
+                null, method, args, parameterNameDiscoverer);
+
+        // 解析并返回字符串结果
+        return expressionParser.parseExpression(el).getValue(context, String.class);
     }
 }
