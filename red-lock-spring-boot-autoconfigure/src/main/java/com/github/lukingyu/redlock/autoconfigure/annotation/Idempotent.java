@@ -1,38 +1,46 @@
 package com.github.lukingyu.redlock.autoconfigure.annotation;
 
-import java.lang.annotation.*;
+import java.lang.annotation.Documented;
+import java.lang.annotation.ElementType;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.lang.annotation.Target;
 import java.util.concurrent.TimeUnit;
 
-@Target(value = ElementType.METHOD)
-@Retention(value = RetentionPolicy.RUNTIME)
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
 @Documented
 public @interface Idempotent {
 
     /**
-     * 幂等Key的前缀，区分业务
+     * Redis key prefix. It can be overridden per business scenario.
      */
     String prefix() default "";
 
     /**
-     * 支持 SpEL 表达式
-     * 例如："#order.id" 或 "#userId"
-     * 如果为空，且在Web环境下，则自动计算MD5
+     * Business key expression, for example {@code #order.id} or {@code #userId}.
+     * If empty in a web request, a fingerprint based on the request is used.
      */
-    String spEL() default "";
-
+    String key() default "";
 
     /**
-     * 过期时间（默认5秒内不允许重复提交）
+     * Backward-compatible alias for early versions.
+     */
+    @Deprecated(since = "1.1.0", forRemoval = false)
+    String spEL() default "";
+
+    /**
+     * Lock expiration. Values less than or equal to 0 use the global configuration.
      */
     long timeout() default -1;
 
     /**
-     * 时间单位
+     * Time unit for {@link #timeout()}.
      */
-    TimeUnit timeUnit() default TimeUnit.NANOSECONDS;
+    TimeUnit timeUnit() default TimeUnit.SECONDS;
 
     /**
-     * 提示信息
+     * Exception message when a duplicate request is detected.
      */
     String message() default "";
 }

@@ -1,16 +1,19 @@
 target/
-!.mvn/wrapper/maven-wrapper.jar
-!**/src/main/**/target/
-!**/src/test/**/target/
-.kotlin
+
+.mvn/timing.properties
 
 .idea/
-.mvn/
-.idea/modules.xml
-.idea/jarRepositories.xml
-.idea/compiler.xml
-.idea/libraries/
 *.iws
 *.iml
 *.ipr
 
+.classpath
+.project
+.settings/
+
+.DS_Store
+Thumbs.db
+
+*.log
+hs_err_pid*
+replay_pid*

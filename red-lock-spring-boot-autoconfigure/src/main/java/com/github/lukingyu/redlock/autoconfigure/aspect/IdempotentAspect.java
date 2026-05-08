@@ -3,7 +3,6 @@ package com.github.lukingyu.redlock.autoconfigure.aspect;
 import com.github.lukingyu.redlock.autoconfigure.annotation.Idempotent;
 import com.github.lukingyu.redlock.autoconfigure.config.RedLockProperties;
 import com.github.lukingyu.redlock.autoconfigure.exception.IdempotentException;
-import lombok.RequiredArgsConstructor;
 import org.aspectj.lang.JoinPoint;
 import org.aspectj.lang.annotation.Aspect;
 import org.aspectj.lang.annotation.Before;
@@ -14,108 +13,272 @@ import org.springframework.core.ParameterNameDiscoverer;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.data.redis.core.script.RedisScript;
-import org.springframework.expression.ExpressionParser;
 import org.springframework.expression.spel.standard.SpelExpressionParser;
+import org.springframework.util.ClassUtils;
 import org.springframework.util.DigestUtils;
+import org.springframework.util.ReflectionUtils;
 import org.springframework.util.StringUtils;
-import org.springframework.web.context.request.RequestContextHolder;
-import org.springframework.web.context.request.ServletRequestAttributes;
-import jakarta.servlet.http.HttpServletRequest;
 
+import java.lang.reflect.Array;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.net.URI;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.time.temporal.TemporalAccessor;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 @Aspect
-@RequiredArgsConstructor
 public class IdempotentAspect {
+
+    private static final String REQUEST_CONTEXT_HOLDER_CLASS =
+            "org.springframework.web.context.request.RequestContextHolder";
+
+    private static final String SERVLET_REQUEST_ATTRIBUTES_CLASS =
+            "org.springframework.web.context.request.ServletRequestAttributes";
+
+    private static final String LUA_SCRIPT_TEXT =
+            """
+            local result = redis.call('set', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2])
+            if result then
+                return 1
+            end
+            return 0
+            """;
 
     private final StringRedisTemplate redisTemplate;
     private final RedLockProperties properties;
 
-    // SpEL 解析器
     private final ParameterNameDiscoverer parameterNameDiscoverer = new DefaultParameterNameDiscoverer();
-    private final ExpressionParser expressionParser = new SpelExpressionParser();
-
-    // LUA脚本：判断key是否存在，不存在则设置并设置过期时间
-    private static final String LUA_SCRIPT_TEXT =
-        """
-        if redis.call('setnx', KEYS[1], ARGV[1]) == 1 then
-           redis.call('expire', KEYS[1], ARGV[2])
-           return 1
-        else
-           return 0
-        end
-        """;
-    
+    private final SpelExpressionParser expressionParser = new SpelExpressionParser();
     private final RedisScript<Long> redisScript = new DefaultRedisScript<>(LUA_SCRIPT_TEXT, Long.class);
+
+    public IdempotentAspect(StringRedisTemplate redisTemplate, RedLockProperties properties) {
+        this.redisTemplate = redisTemplate;
+        this.properties = properties;
+    }
 
     @Before("@annotation(idempotent)")
     public void before(JoinPoint joinPoint, Idempotent idempotent) {
-        // 1. 获取请求参数，生成 Key
         String key = generateKey(joinPoint, idempotent);
+        long expireMillis = resolveExpireMillis(idempotent);
 
-        long timeOut = idempotent.timeout() != -1 ? idempotent.timeout() : properties.getTimeout();
-        TimeUnit timeUnit = idempotent.timeUnit() != TimeUnit.NANOSECONDS ? idempotent.timeUnit() : properties.getTimeUnit();
+        Long result = redisTemplate.execute(redisScript, Collections.singletonList(key), "1", String.valueOf(expireMillis));
 
-        // 2. 执行 Lua 脚本
-        Long result = redisTemplate.execute(redisScript, Collections.singletonList(key), "1", String.valueOf(timeUnit.toSeconds(timeOut)));
-
-        // 3. 判断结果：0表示锁已存在
-        if (result == 0) {
+        if (!Long.valueOf(1L).equals(result)) {
             String message = StringUtils.hasText(idempotent.message()) ? idempotent.message() : properties.getMessage();
             throw new IdempotentException(message);
         }
     }
 
-    /**
-     * Key生成策略：前缀 + MD5(Token + 请求参数 + 请求路径)
-     * 确保同一个用户，对同一个接口，用同样的参数，在短时间内只能调一次
-     */
     private String generateKey(JoinPoint joinPoint, Idempotent idempotent) {
+        String prefix = StringUtils.hasText(idempotent.prefix()) ? idempotent.prefix() : properties.getPrefix();
+        String expression = resolveKeyExpression(idempotent);
 
-        final String prefix = StringUtils.hasText(idempotent.prefix()) ? idempotent.prefix() : properties.getPrefix();
-        //目前只支持注解传入
-        final String spEL = idempotent.spEL();
-
-        // 用户使用了 SpEL 表达式 去获取自定义Key
-        if (StringUtils.hasText(spEL)) {
-            return prefix + parseSpel(spEL, joinPoint);
+        if (StringUtils.hasText(expression)) {
+            return prefix + parseSpel(expression, joinPoint);
         }
 
-        // 用户没配置 Key，尝试自动使用 Web 环境的 URL + Token
-        // 先判断是否为 Web 环境，防止非 Web 项目报错
-        if (RequestContextHolder.getRequestAttributes() != null) {
-            HttpServletRequest request = ((ServletRequestAttributes) RequestContextHolder.getRequestAttributes()).getRequest();
-            // 实际场景建议取 Authorization Header 或 UserID
-            String token = request.getHeader("Authorization");
-            String method = request.getMethod();
-            String uri = request.getRequestURI();
-            // 简单的将参数toString
-            String args = java.util.Arrays.toString(joinPoint.getArgs());
-
-            String rawKey = token + ":" + method + ":" + uri + ":" + args;
-            // MD5加密缩短Key长度
-            return prefix + DigestUtils.md5DigestAsHex(rawKey.getBytes());
-        }
-
-        // 既没有 SpEL，又不是 Web 环境 -> 抛出异常，提示用户必须配置 key
-        throw new IllegalArgumentException("在非Web环境下，@Idempotent 注解必须配置 spEL 属性！");
+        return buildWebRequestFingerprint(joinPoint)
+                .map(rawKey -> prefix + DigestUtils.md5DigestAsHex(rawKey.getBytes(StandardCharsets.UTF_8)))
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "In a non-web context, @Idempotent must configure a key expression."));
     }
 
-    /**
-     * 解析 SpEL 表达式
-     */
-    private String parseSpel(String el, JoinPoint joinPoint) {
+    private long resolveExpireMillis(Idempotent idempotent) {
+        long timeout = idempotent.timeout() > 0 ? idempotent.timeout() : properties.getTimeout();
+        TimeUnit timeUnit = idempotent.timeout() > 0 ? idempotent.timeUnit() : properties.getTimeUnit();
+        long expireMillis = timeUnit.toMillis(timeout);
+        if (expireMillis <= 0) {
+            throw new IllegalArgumentException("@Idempotent timeout must be greater than 0 milliseconds.");
+        }
+        return expireMillis;
+    }
+
+    @SuppressWarnings("deprecation")
+    private String resolveKeyExpression(Idempotent idempotent) {
+        boolean hasKey = StringUtils.hasText(idempotent.key());
+        boolean hasLegacyKey = StringUtils.hasText(idempotent.spEL());
+        if (hasKey && hasLegacyKey && !idempotent.key().equals(idempotent.spEL())) {
+            throw new IllegalArgumentException("@Idempotent key and spEL cannot be configured at the same time.");
+        }
+        return hasKey ? idempotent.key() : idempotent.spEL();
+    }
+
+    private String parseSpel(String expression, JoinPoint joinPoint) {
         MethodSignature methodSignature = (MethodSignature) joinPoint.getSignature();
         Method method = methodSignature.getMethod();
         Object[] args = joinPoint.getArgs();
 
-        // 创建 SpEL 上下文
         MethodBasedEvaluationContext context = new MethodBasedEvaluationContext(
                 null, method, args, parameterNameDiscoverer);
 
-        // 解析并返回字符串结果
-        return expressionParser.parseExpression(el).getValue(context, String.class);
+        Object value = expressionParser.parseExpression(expression).getValue(context);
+        String key = Objects.toString(value, "");
+        if (!StringUtils.hasText(key)) {
+            throw new IllegalArgumentException("@Idempotent key expression must not evaluate to empty.");
+        }
+        return key;
+    }
+
+    private Optional<String> buildWebRequestFingerprint(JoinPoint joinPoint) {
+        return currentRequest()
+                .map(request -> String.join(":",
+                        request.authorization(),
+                        request.method(),
+                        request.uri(),
+                        fingerprintArguments(joinPoint.getArgs())));
+    }
+
+    private Optional<RequestSnapshot> currentRequest() {
+        ClassLoader classLoader = ClassUtils.getDefaultClassLoader();
+        if (!ClassUtils.isPresent(REQUEST_CONTEXT_HOLDER_CLASS, classLoader)) {
+            return Optional.empty();
+        }
+
+        try {
+            Class<?> holderClass = ClassUtils.forName(REQUEST_CONTEXT_HOLDER_CLASS, classLoader);
+            Object attributes = holderClass.getMethod("getRequestAttributes").invoke(null);
+            Class<?> servletRequestAttributesClass = ClassUtils.forName(SERVLET_REQUEST_ATTRIBUTES_CLASS, classLoader);
+            if (attributes == null || !servletRequestAttributesClass.isInstance(attributes)) {
+                return Optional.empty();
+            }
+
+            Object request = servletRequestAttributesClass.getMethod("getRequest").invoke(attributes);
+            return Optional.of(new RequestSnapshot(
+                    invokeString(request, "getHeader", "Authorization"),
+                    invokeString(request, "getMethod"),
+                    invokeString(request, "getRequestURI")));
+        }
+        catch (ReflectiveOperationException | LinkageError ex) {
+            return Optional.empty();
+        }
+    }
+
+    private String invokeString(Object target, String methodName, Object... args) throws ReflectiveOperationException {
+        Class<?>[] parameterTypes = new Class<?>[args.length];
+        for (int i = 0; i < args.length; i++) {
+            parameterTypes[i] = args[i].getClass();
+        }
+        Method method = target.getClass().getMethod(methodName, parameterTypes);
+        return Objects.toString(method.invoke(target, args), "");
+    }
+
+    private String fingerprintArguments(Object[] args) {
+        List<String> parts = new ArrayList<>(args.length);
+        for (Object arg : args) {
+            parts.add(fingerprintValue(arg, Collections.newSetFromMap(new IdentityHashMap<>())));
+        }
+        return "[" + String.join(",", parts) + "]";
+    }
+
+    private String fingerprintValue(Object value, Set<Object> visiting) {
+        if (value == null) {
+            return "null";
+        }
+
+        Class<?> type = value.getClass();
+        if (isSimpleValueType(type)) {
+            return String.valueOf(value);
+        }
+
+        if (type.isArray()) {
+            int length = Array.getLength(value);
+            List<String> parts = new ArrayList<>(length);
+            for (int i = 0; i < length; i++) {
+                parts.add(fingerprintValue(Array.get(value, i), visiting));
+            }
+            return "[" + String.join(",", parts) + "]";
+        }
+
+        if (value instanceof Iterable<?> iterable) {
+            List<String> parts = new ArrayList<>();
+            for (Object item : iterable) {
+                parts.add(fingerprintValue(item, visiting));
+            }
+            return "[" + String.join(",", parts) + "]";
+        }
+
+        if (value instanceof Map<?, ?> map) {
+            List<String> parts = new ArrayList<>();
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                parts.add(fingerprintValue(entry.getKey(), visiting) + "=" + fingerprintValue(entry.getValue(), visiting));
+            }
+            Collections.sort(parts);
+            return "{" + String.join(",", parts) + "}";
+        }
+
+        if (isFrameworkType(type)) {
+            return type.getName();
+        }
+
+        if (!visiting.add(value)) {
+            return "<cycle>";
+        }
+
+        try {
+            return fingerprintFields(value, type, visiting);
+        }
+        finally {
+            visiting.remove(value);
+        }
+    }
+
+    private String fingerprintFields(Object value, Class<?> type, Set<Object> visiting) {
+        List<Field> fields = new ArrayList<>();
+        Class<?> current = type;
+        while (current != null && current != Object.class) {
+            for (Field field : current.getDeclaredFields()) {
+                int modifiers = field.getModifiers();
+                if (!field.isSynthetic() && !Modifier.isStatic(modifiers) && !Modifier.isTransient(modifiers)) {
+                    fields.add(field);
+                }
+            }
+            current = current.getSuperclass();
+        }
+
+        fields.sort(Comparator.comparing(Field::getName));
+        List<String> parts = new ArrayList<>(fields.size());
+        for (Field field : fields) {
+            ReflectionUtils.makeAccessible(field);
+            parts.add(field.getName() + "=" + fingerprintValue(ReflectionUtils.getField(field, value), visiting));
+        }
+        return type.getName() + "{" + String.join(",", parts) + "}";
+    }
+
+    private boolean isSimpleValueType(Class<?> type) {
+        return type.isPrimitive()
+                || CharSequence.class.isAssignableFrom(type)
+                || Number.class.isAssignableFrom(type)
+                || Boolean.class == type
+                || Character.class == type
+                || Date.class.isAssignableFrom(type)
+                || TemporalAccessor.class.isAssignableFrom(type)
+                || UUID.class == type
+                || URI.class == type
+                || URL.class == type
+                || Enum.class.isAssignableFrom(type);
+    }
+
+    private boolean isFrameworkType(Class<?> type) {
+        String name = type.getName();
+        return name.startsWith("jakarta.servlet.")
+                || name.startsWith("javax.servlet.")
+                || name.startsWith("org.springframework.");
+    }
+
+    private record RequestSnapshot(String authorization, String method, String uri) {
     }
 }

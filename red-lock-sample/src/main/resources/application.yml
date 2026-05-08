@@ -3,8 +3,18 @@ server:
   servlet:
     context-path: /redlock
 
+spring:
+  application:
+    name: red-lock-sample
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      database: 0
+
 red-lock:
+  enabled: true
   prefix: "idempotent:"
   timeout: 10
   time-unit: seconds
-  message: 操作太快，请稍后再试
+  message: "操作太快，请稍后再试"
